@@ -1,0 +1,280 @@
+using System.Diagnostics;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+
+namespace Crisol;
+
+/// <summary>
+/// Una fuente capturada: loopback de un dispositivo de salida (lo que suena en él)
+/// o un dispositivo de captura (micrófono). Entrega audio ya convertido al formato del mezclador.
+/// </summary>
+public sealed class SourceTap : IDisposable
+{
+    // Si el buffer acumula más que esto es deriva de reloj entre dispositivos:
+    // se resincroniza (salto audible breve) para que la latencia no crezca sin límite.
+    private static readonly TimeSpan ResyncThreshold = TimeSpan.FromMilliseconds(250);
+
+    private readonly IWaveIn _capture;
+    private readonly BufferedWaveProvider _buffer;
+    private readonly VolumeSampleProvider _volume;
+
+    public string DeviceId { get; }
+    public ISampleProvider Output => _volume;
+
+    public float Volume
+    {
+        get => _volume.Volume;
+        set => _volume.Volume = value;
+    }
+
+    public SourceTap(MMDevice device, int mixRate, float volume)
+    {
+        DeviceId = device.ID;
+        _capture = device.DataFlow == DataFlow.Render
+            ? new WasapiLoopbackCapture(device)
+            : new WasapiCapture(device);
+
+        _buffer = new BufferedWaveProvider(_capture.WaveFormat)
+        {
+            BufferDuration = TimeSpan.FromMilliseconds(500),
+            DiscardOnBufferOverflow = true,
+            ReadFully = true,
+        };
+        _capture.DataAvailable += (_, e) =>
+        {
+            if (_buffer.BufferedDuration > ResyncThreshold)
+                _buffer.ClearBuffer();
+            _buffer.AddSamples(e.Buffer, 0, e.BytesRecorded);
+        };
+
+        ISampleProvider sp = _buffer.ToSampleProvider();
+        if (sp.WaveFormat.Channels == 1)
+            sp = new MonoToStereoSampleProvider(sp);
+        else if (sp.WaveFormat.Channels > 2)
+            sp = new MultiplexingSampleProvider(new[] { sp }, 2);
+        if (sp.WaveFormat.SampleRate != mixRate)
+            sp = new WdlResamplingSampleProvider(sp, mixRate);
+
+        _volume = new VolumeSampleProvider(sp) { Volume = volume };
+        _capture.StartRecording();
+    }
+
+    public void Dispose()
+    {
+        try { _capture.StopRecording(); } catch { /* ya detenido o dispositivo retirado */ }
+        _capture.Dispose();
+    }
+}
+
+/// <summary>
+/// Una salida física: recibe la mezcla ya lista y la reproduce en su dispositivo
+/// con su propio volumen. En WASAPI compartido convive con el audio de otras apps.
+/// </summary>
+public sealed class OutputLeg : IDisposable
+{
+    private static readonly TimeSpan ResyncThreshold = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan Prefill = TimeSpan.FromMilliseconds(80);
+
+    private readonly BufferedWaveProvider _buffer;
+    private readonly VolumeSampleProvider _volume;
+    private readonly WasapiOut _out;
+    private readonly int _prefillBytes;
+
+    public string DeviceId { get; }
+
+    public float Volume
+    {
+        get => _volume.Volume;
+        set => _volume.Volume = value;
+    }
+
+    public OutputLeg(MMDevice device, WaveFormat mixFormat, float volume)
+    {
+        DeviceId = device.ID;
+        _buffer = new BufferedWaveProvider(mixFormat)
+        {
+            BufferDuration = TimeSpan.FromMilliseconds(500),
+            DiscardOnBufferOverflow = true,
+            ReadFully = true,
+        };
+        _prefillBytes = (int)(mixFormat.AverageBytesPerSecond * Prefill.TotalSeconds);
+        _prefillBytes -= _prefillBytes % mixFormat.BlockAlign;
+        WritePrefill();
+
+        _volume = new VolumeSampleProvider(_buffer.ToSampleProvider()) { Volume = volume };
+        _out = new WasapiOut(device, AudioClientShareMode.Shared, true, 50);
+        _out.Init(new SampleToWaveProvider(_volume));
+        _out.Play();
+    }
+
+    // Colchón de silencio: mantiene la latencia estable en vez de leer un buffer vacío (crujidos).
+    private void WritePrefill() => _buffer.AddSamples(new byte[_prefillBytes], 0, _prefillBytes);
+
+    public void Write(byte[] data, int count)
+    {
+        if (_buffer.BufferedDuration > ResyncThreshold)
+        {
+            _buffer.ClearBuffer();
+            WritePrefill();
+        }
+        _buffer.AddSamples(data, 0, count);
+    }
+
+    public void Dispose() => _out.Dispose();
+}
+
+/// <summary>
+/// Motor: N fuentes → mezclador (48 kHz estéreo float) → volumen general → bomba en tiempo
+/// real que reparte la MISMA mezcla a M salidas físicas (sincronizadas entre sí).
+/// </summary>
+public sealed class AudioEngine : IDisposable
+{
+    public const int MixRate = 48000;
+    public static readonly WaveFormat MixFormat = WaveFormat.CreateIeeeFloatWaveFormat(MixRate, 2);
+
+    private readonly MixingSampleProvider _mixer;
+    private readonly VolumeSampleProvider _master;
+    private readonly IWaveProvider _masterWave;
+    private readonly Dictionary<string, SourceTap> _taps = new();
+    private readonly Dictionary<string, OutputLeg> _legs = new();
+    private readonly object _lock = new();
+    private readonly Thread _pump;
+    private volatile bool _running = true;
+
+    public int SourceCount { get { lock (_lock) return _taps.Count; } }
+    public int OutputCount { get { lock (_lock) return _legs.Count; } }
+
+    public float MasterVolume
+    {
+        get => _master.Volume;
+        set => _master.Volume = value;
+    }
+
+    public AudioEngine()
+    {
+        _mixer = new MixingSampleProvider(MixFormat)
+        {
+            ReadFully = true, // rinde silencio aunque no haya fuentes: la bomba nunca se detiene
+        };
+        _master = new VolumeSampleProvider(_mixer) { Volume = 1.0f };
+        _masterWave = new SampleToWaveProvider(_master);
+        _pump = new Thread(PumpLoop) { IsBackground = true, Priority = ThreadPriority.AboveNormal, Name = "CrisolPump" };
+        _pump.Start();
+    }
+
+    /// <summary>
+    /// Lee la mezcla al ritmo del reloj de pared en trozos de 10 ms y escribe los MISMOS
+    /// bytes en todas las salidas: eso es lo que las mantiene sincronizadas entre sí.
+    /// </summary>
+    private void PumpLoop()
+    {
+        int byteRate = MixFormat.AverageBytesPerSecond;
+        int blockAlign = MixFormat.BlockAlign;
+        byte[] chunk = new byte[byteRate / 100]; // 10 ms
+        long maxBacklog = byteRate / 2;          // tras una suspensión del equipo, no recuperar más de 500 ms
+        var sw = Stopwatch.StartNew();
+        long sent = 0;
+
+        while (_running)
+        {
+            long target = (long)(sw.Elapsed.TotalSeconds * byteRate);
+            target -= target % blockAlign;
+            if (target - sent > maxBacklog)
+                sent = target - maxBacklog;
+
+            while (sent < target && _running)
+            {
+                int n = (int)Math.Min(chunk.Length, target - sent);
+                n -= n % blockAlign;
+                if (n == 0) break;
+                int read = _masterWave.Read(chunk, 0, n);
+                if (read == 0) break;
+                lock (_lock)
+                {
+                    foreach (var leg in _legs.Values)
+                        leg.Write(chunk, read);
+                }
+                sent += read;
+            }
+            Thread.Sleep(5);
+        }
+    }
+
+    public void AddSource(MMDevice device, float volume)
+    {
+        lock (_lock)
+        {
+            if (_taps.ContainsKey(device.ID)) return;
+            var tap = new SourceTap(device, MixRate, volume);
+            _taps[device.ID] = tap;
+            _mixer.AddMixerInput(tap.Output);
+        }
+    }
+
+    public void RemoveSource(string deviceId)
+    {
+        lock (_lock)
+        {
+            if (_taps.Remove(deviceId, out var tap))
+            {
+                _mixer.RemoveMixerInput(tap.Output);
+                tap.Dispose();
+            }
+        }
+    }
+
+    public void SetSourceVolume(string deviceId, float volume)
+    {
+        lock (_lock)
+        {
+            if (_taps.TryGetValue(deviceId, out var tap))
+                tap.Volume = volume;
+        }
+    }
+
+    public void AddOutput(MMDevice device, float volume)
+    {
+        lock (_lock)
+        {
+            if (_legs.ContainsKey(device.ID)) return;
+            _legs[device.ID] = new OutputLeg(device, MixFormat, volume);
+        }
+    }
+
+    public void RemoveOutput(string deviceId)
+    {
+        lock (_lock)
+        {
+            if (_legs.Remove(deviceId, out var leg))
+                leg.Dispose();
+        }
+    }
+
+    public void SetOutputVolume(string deviceId, float volume)
+    {
+        lock (_lock)
+        {
+            if (_legs.TryGetValue(deviceId, out var leg))
+                leg.Volume = volume;
+        }
+    }
+
+    public void RemoveAll()
+    {
+        lock (_lock)
+        {
+            foreach (var tap in _taps.Values) { _mixer.RemoveMixerInput(tap.Output); tap.Dispose(); }
+            _taps.Clear();
+            foreach (var leg in _legs.Values) leg.Dispose();
+            _legs.Clear();
+        }
+    }
+
+    public void Dispose()
+    {
+        _running = false;
+        try { _pump.Join(500); } catch { }
+        RemoveAll();
+    }
+}
