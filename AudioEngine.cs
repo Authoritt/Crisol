@@ -7,6 +7,18 @@ using NAudio.Wave.SampleProviders;
 namespace Crisol;
 
 /// <summary>
+/// Loopback WASAPI con buffer de 20 ms: NAudio usa 100 ms por defecto y sondea cada
+/// media ventana, lo que metía ~50 ms de lag solo en la captura.
+/// </summary>
+public sealed class LowLatencyLoopbackCapture : WasapiCapture
+{
+    public LowLatencyLoopbackCapture(MMDevice device) : base(device, false, 20) { }
+
+    protected override AudioClientStreamFlags GetAudioClientStreamFlags()
+        => AudioClientStreamFlags.Loopback | base.GetAudioClientStreamFlags();
+}
+
+/// <summary>
 /// Una fuente capturada: loopback de un dispositivo de salida (lo que suena en él)
 /// o un dispositivo de captura (micrófono). Entrega audio ya convertido al formato del mezclador.
 /// </summary>
@@ -14,7 +26,7 @@ public sealed class SourceTap : IDisposable
 {
     // Si el buffer acumula más que esto es deriva de reloj entre dispositivos:
     // se resincroniza (salto audible breve) para que la latencia no crezca sin límite.
-    private static readonly TimeSpan ResyncThreshold = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan ResyncThreshold = TimeSpan.FromMilliseconds(150);
 
     private readonly IWaveIn _capture;
     private readonly BufferedWaveProvider _buffer;
@@ -35,8 +47,8 @@ public sealed class SourceTap : IDisposable
     {
         DeviceId = device.ID;
         _capture = device.DataFlow == DataFlow.Render
-            ? new WasapiLoopbackCapture(device)
-            : new WasapiCapture(device);
+            ? new LowLatencyLoopbackCapture(device)
+            : new WasapiCapture(device, false, 20);
 
         _buffer = new BufferedWaveProvider(_capture.WaveFormat)
         {
@@ -77,8 +89,8 @@ public sealed class SourceTap : IDisposable
 /// </summary>
 public sealed class OutputLeg : IDisposable
 {
-    private static readonly TimeSpan ResyncThreshold = TimeSpan.FromMilliseconds(250);
-    private static readonly TimeSpan Prefill = TimeSpan.FromMilliseconds(80);
+    private static readonly TimeSpan ResyncThreshold = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan Prefill = TimeSpan.FromMilliseconds(40);
 
     private readonly BufferedWaveProvider _buffer;
     private readonly VolumeSampleProvider _volume;
@@ -107,7 +119,7 @@ public sealed class OutputLeg : IDisposable
         WritePrefill();
 
         _volume = new VolumeSampleProvider(_buffer.ToSampleProvider()) { Volume = volume };
-        _out = new WasapiOut(device, AudioClientShareMode.Shared, true, 50);
+        _out = new WasapiOut(device, AudioClientShareMode.Shared, true, 40);
         _out.Init(new SampleToWaveProvider(_volume));
         _out.Play();
     }
@@ -182,7 +194,7 @@ public sealed class AudioEngine : IDisposable
         int byteRate = MixFormat.AverageBytesPerSecond;
         int blockAlign = MixFormat.BlockAlign;
         byte[] chunk = new byte[byteRate / 100]; // 10 ms
-        long maxBacklog = byteRate / 2;          // tras una suspensión del equipo, no recuperar más de 500 ms
+        long maxBacklog = byteRate / 10;         // si la bomba se atrasa >100 ms (suspensión, stall), salta al presente
         var sw = Stopwatch.StartNew();
         long sent = 0;
 
@@ -297,6 +309,15 @@ public sealed class AudioEngine : IDisposable
                 leg.Volume = volume;
         }
     }
+
+    /// <summary>Inyecta un tono en el mezclador; al terminar, el mezclador lo retira solo.</summary>
+    public void PlayTestTone(double seconds, double frequency = 500)
+    {
+        var sig = new SignalGenerator(MixRate, 2) { Gain = 0.25, Frequency = frequency, Type = SignalGeneratorType.Sin };
+        _mixer.AddMixerInput(sig.Take(TimeSpan.FromSeconds(seconds)));
+    }
+
+    public void ResetPeak() => _mixPeak = 0;
 
     public void RemoveAll()
     {

@@ -4,6 +4,8 @@ using System.Windows;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using NAudio.CoreAudioApi;
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using WinForms = System.Windows.Forms;
 using Drawing = System.Drawing;
 
@@ -292,6 +294,71 @@ public partial class MainWindow : Window
         if (row.IsOutputRole) _engine.SetOutputVolume(row.Id, v);
         else _engine.SetSourceVolume(row.Id, v);
         QueueSave();
+    }
+
+    // ---------- prueba de sonido ----------
+
+    private bool _testing;
+
+    private async void Test_Click(object sender, RoutedEventArgs e)
+    {
+        if (_testing) return;
+        _testing = true;
+        TestButton.IsEnabled = false;
+        try
+        {
+            double freq = 440;
+            foreach (var row in _outputs)
+            {
+                if (!_devicesById.TryGetValue(row.Id, out var dev)) continue;
+                SetStatus($"Tono directo ({freq:F0} Hz) → {row.Name}…");
+                try { await PlayToneAsync(dev, freq, 1.5); }
+                catch (Exception ex)
+                {
+                    SetStatus($"Falló el tono en «{row.Name}»: {ex.Message}");
+                    await Task.Delay(1500);
+                }
+                freq += 220;
+            }
+
+            int legs = _engine.OutputCount;
+            if (legs == 0)
+            {
+                SetStatus("Tonos directos listos. No hay salidas marcadas: no se probó la mezcla.");
+                return;
+            }
+
+            long tapBytesBefore = _engine.TotalTapBytes;
+            _engine.ResetPeak();
+            SetStatus($"Tono por la mezcla de Crisol → {legs} salida(s) marcada(s)…");
+            _engine.PlayTestTone(2);
+            await Task.Delay(2600);
+
+            bool mixOk = _engine.MixPeak > 0.1f && _engine.PumpAlive;
+            string fuentes = _engine.SourceCount == 0
+                ? "sin fuentes marcadas"
+                : _engine.TotalTapBytes > tapBytesBefore
+                    ? $"{_engine.SourceCount} fuente(s) entregando audio"
+                    : $"{_engine.SourceCount} fuente(s) marcada(s) pero sin audio ahora (¿está sonando algo ahí?)";
+            SetStatus(mixOk
+                ? $"Prueba OK: la mezcla sonó en {legs} salida(s); {fuentes}."
+                : "La mezcla no produjo señal: revisa %APPDATA%\\Crisol\\error.log y pulsa ⟳.");
+        }
+        finally
+        {
+            _testing = false;
+            TestButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>Tono directo al dispositivo, sin pasar por el motor: prueba solo el hardware.</summary>
+    private static async Task PlayToneAsync(MMDevice device, double freq, double seconds)
+    {
+        using var toneOut = new WasapiOut(device, AudioClientShareMode.Shared, true, 100);
+        var sig = new SignalGenerator(48000, 2) { Gain = 0.25, Frequency = freq, Type = SignalGeneratorType.Sin };
+        toneOut.Init(new SampleToWaveProvider(sig.Take(TimeSpan.FromSeconds(seconds))));
+        toneOut.Play();
+        await Task.Delay(TimeSpan.FromSeconds(seconds + 0.4));
     }
 
     private void Master_Changed(object sender, RoutedEventArgs e)

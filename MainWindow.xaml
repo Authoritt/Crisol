@@ -60,6 +60,9 @@
         <DockPanel DockPanel.Dock="Top" Margin="0,0,0,4">
             <Button DockPanel.Dock="Right" Content="⟳" Width="30" Height="24"
                     ToolTip="Actualizar dispositivos" Click="Refresh_Click"/>
+            <Button DockPanel.Dock="Right" x:Name="TestButton" Content="Probar" Padding="10,2" Height="24"
+                    Margin="8,0,8,0" ToolTip="Tono directo a cada salida y luego por la mezcla, con verificación"
+                    Click="Test_Click"/>
             <TextBlock Text="Marca qué entra a la mezcla y por dónde sale. Todo suena a la vez, sincronizado."
                        FontSize="11" Foreground="#FF9A9AA5" TextWrapping="Wrap" VerticalAlignment="Center"/>
         </DockPanel>
