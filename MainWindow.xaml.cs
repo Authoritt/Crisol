@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using WinForms = System.Windows.Forms;
@@ -81,6 +82,15 @@ public partial class MainWindow : Window
     private bool _exiting;
     private bool _loading;
     private string? _defaultRenderId;
+    private readonly DispatcherTimer _reconcileTimer = new();
+    private MMNotifications? _notifier;
+    private DateTime _reconcileAt;
+    private bool _needsRetry;
+    private readonly Dictionary<string, int> _addFailures = new();                 // fallos de arranque consecutivos por dispositivo
+    private readonly Dictionary<string, (int count, DateTime since)> _stops = new();// caídas por dispositivo dentro de la ventana
+    private const int MaxAddFailures = 5;      // tras esto, se rinde y desmarca (no reintenta en bucle)
+    private const int MaxStopsPerWindow = 4;   // tras esto, se pausa el dispositivo que se cae solo sin parar
+    private static readonly TimeSpan StopWindow = TimeSpan.FromSeconds(10);
 
     private enum CableAction { Install, Activate, None }
     private CableAction _cableAction = CableAction.Install;
@@ -102,9 +112,129 @@ public partial class MainWindow : Window
         vuTimer.Start();
 
         SetupTray();
+        WireDeviceRecovery();
         RefreshDevices();
         StartEngineFromUi();
         AutostartCheck.IsChecked = IsAutostartEnabled();
+    }
+
+    // ---------- recuperación de dispositivos ----------
+
+    /// <summary>
+    /// Al suspender, Windows invalida los clientes WASAPI y NAudio no se reconecta solo: la app
+    /// quedaba muda tras reanudar (ni en vivo ni en el test). Escuchamos tres señales —reanudar,
+    /// cambios de endpoints y la muerte de una fuente/salida— y todas convergen en un reconcile
+    /// coalescido que reconstruye el motor con dispositivos frescos.
+    /// </summary>
+    private void WireDeviceRecovery()
+    {
+        _reconcileTimer.Tick += ReconcileTick;
+        _engine.DeviceLost += OnEngineDeviceLost;
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        _notifier = new MMNotifications(() => Dispatcher.BeginInvoke(() => ScheduleReconcile(resume: false)));
+        try { _enumerator.RegisterEndpointNotificationCallback(_notifier); } catch { }
+    }
+
+    // La pata/tap puede morir en un hilo de WASAPI: marshalar a la UI antes de tocar el motor.
+    private void OnEngineDeviceLost(string deviceId)
+        => Dispatcher.BeginInvoke(() => HandleDeviceLost(deviceId));
+
+    private void HandleDeviceLost(string deviceId)
+    {
+        // Un dispositivo que se cae una y otra vez reconstruiría TODO el motor cada ~1.2 s,
+        // glitcheando las salidas sanas sin fin. Si se cae demasiado en la ventana, se pausa.
+        if (RegisterStop(deviceId))
+        {
+            var row = _outputs.Concat(_sources).FirstOrDefault(r => r.Id == deviceId);
+            if (row != null)
+            {
+                SetRowEnabledSilently(row, false);
+                SetStatus($"«{row.Name}» se desconecta sola sin parar; la pauso. Vuelve a marcarla para reintentar.");
+            }
+        }
+        ScheduleReconcile(resume: false);
+    }
+
+    // true si el dispositivo se ha caído tantas veces dentro de la ventana que hay que pausarlo.
+    private bool RegisterStop(string id)
+    {
+        var now = DateTime.UtcNow;
+        if (!_stops.TryGetValue(id, out var s) || now - s.since > StopWindow)
+            s = (0, now);
+        s.count++;
+        _stops[id] = s;
+        if (s.count >= MaxStopsPerWindow) { _stops.Remove(id); return true; }
+        return false;
+    }
+
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        // Al reanudar, los endpoints tardan ~1-2 s en volver a registrarse: espera un poco más.
+        if (e.Mode == PowerModes.Resume)
+            Dispatcher.BeginInvoke(() => ScheduleReconcile(resume: true));
+    }
+
+    // Coalesce ráfagas (reanudar dispara muchos eventos a la vez) en un solo reconcile. Un evento
+    // corriente NO adelanta un reconcile ya en cola: así el retardo largo de resume no lo pisan
+    // las notificaciones de endpoint que llegan durante la propia reanudación.
+    private void ScheduleReconcile(bool resume)
+    {
+        double ms = resume ? 2500 : 1200;
+        if (!resume && _reconcileTimer.IsEnabled &&
+            (_reconcileAt - DateTime.UtcNow).TotalMilliseconds > ms)
+            return;
+        _reconcileAt = DateTime.UtcNow.AddMilliseconds(ms);
+        _reconcileTimer.Stop();
+        _reconcileTimer.Interval = TimeSpan.FromMilliseconds(ms);
+        _reconcileTimer.Start();
+    }
+
+    private void ReconcileTick(object? sender, EventArgs e)
+    {
+        _reconcileTimer.Stop();
+        try { ReconcileDevices(); }
+        catch (Exception ex) { SetStatus("No se pudo reconectar el audio: " + ex.Message); }
+    }
+
+    /// <summary>Reconstruye el motor con dispositivos recién enumerados. Idempotente: si un
+    /// dispositivo aún no volvió, su fila queda marcada y un evento posterior lo reintegra.</summary>
+    private void ReconcileDevices()
+    {
+        SyncConfigFromUi();
+        _engine.RemoveAll();
+        RefreshDevices();
+        StartEngineFromUi();
+    }
+
+    // El endpoint cacheado puede quedar invalidado tras reanudar: re-resuélvelo por ID.
+    private MMDevice? ResolveFresh(string id)
+    {
+        try { return _enumerator.GetDevice(id); }
+        catch { return _devicesById.GetValueOrDefault(id); }
+    }
+
+    // Cambia el estado de una fila sin disparar Row_Toggled (que _loading ya filtra).
+    private void SetRowEnabledSilently(DeviceRow row, bool enabled)
+    {
+        bool prev = _loading; _loading = true;
+        row.Enabled = enabled;
+        _loading = prev;
+    }
+
+    /// <summary>
+    /// Notificaciones de endpoints de audio. Reaccionamos a alta/baja/cambio de estado (cubre
+    /// hot-plug y el reset de drivers al reanudar); ignoramos el cambio de dispositivo por
+    /// defecto —no mata streams y dispararía reconciles en cascada, incluso al activar el cable.
+    /// </summary>
+    private sealed class MMNotifications : IMMNotificationClient
+    {
+        private readonly Action _onChange;
+        public MMNotifications(Action onChange) => _onChange = onChange;
+        public void OnDeviceStateChanged(string deviceId, DeviceState newState) => _onChange();
+        public void OnDeviceAdded(string pwstrDeviceId) => _onChange();
+        public void OnDeviceRemoved(string deviceId) => _onChange();
+        public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId) { }
+        public void OnPropertyValueChanged(string pwstrDeviceId, NAudio.CoreAudioApi.PropertyKey key) { }
     }
 
     // ---------- dispositivos ----------
@@ -268,29 +398,49 @@ public partial class MainWindow : Window
     {
         _engine.RemoveAll();
         _engine.MasterVolume = (float)(MasterSlider.Value / 100.0);
+        _needsRetry = false;
         foreach (var row in _outputs.Where(r => r.Enabled))
             TryAddRow(row);
         foreach (var row in _sources.Where(r => r.Enabled))
             TryAddRow(row);
         UpdateStatus();
+        // Algún dispositivo presente falló al arrancar de forma transitoria (típico en la ventana
+        // de ~1-2 s tras reanudar): reintenta pronto. El tope por dispositivo (MaxAddFailures)
+        // acota el bucle, así que esto no puede quedarse girando indefinidamente.
+        if (_needsRetry)
+            ScheduleReconcile(resume: false);
     }
 
     private void TryAddRow(DeviceRow row)
     {
+        // Dispositivo aún ausente de la enumeración: no cuenta como fallo. Reaparecerá vía la
+        // notificación de endpoint (OnDeviceAdded/StateChanged), que dispara otro reconcile.
+        if (!_devicesById.TryGetValue(row.Id, out var dev)) return;
         try
         {
-            if (!_devicesById.TryGetValue(row.Id, out var dev)) return;
             if (row.IsOutputRole)
                 _engine.AddOutput(dev, (float)(row.Volume / 100.0));
             else
                 _engine.AddSource(dev, (float)(row.Volume / 100.0));
+            _addFailures.Remove(row.Id); // arrancó bien: olvida el historial de fallos
         }
         catch (Exception ex)
         {
-            bool prev = _loading; _loading = true;
-            row.Enabled = false;
-            _loading = prev;
-            SetStatus($"No se pudo usar «{row.Name}»: {ex.Message}");
+            int fails = _addFailures[row.Id] = _addFailures.GetValueOrDefault(row.Id) + 1;
+            if (fails >= MaxAddFailures)
+            {
+                // Fallo persistente (no transitorio): ríndete y desmárcala para dejar de reintentar.
+                _addFailures.Remove(row.Id);
+                SetRowEnabledSilently(row, false);
+                SetStatus($"No se pudo usar «{row.Name}» tras {fails} intentos: {ex.Message}");
+            }
+            else
+            {
+                // Fallo transitorio: NO la apagues ni la persistas (eso la mataría el resto de la
+                // sesión); déjala marcada y reintenta en el próximo reconcile.
+                _needsRetry = true;
+                SetStatus($"Reconectando «{row.Name}»… (intento {fails})");
+            }
         }
     }
 
@@ -347,20 +497,20 @@ public partial class MainWindow : Window
 
     // ---------- handlers UI ----------
 
-    private void Refresh_Click(object sender, RoutedEventArgs e)
-    {
-        SyncConfigFromUi();
-        _engine.RemoveAll();
-        RefreshDevices();
-        StartEngineFromUi();
-    }
+    private void Refresh_Click(object sender, RoutedEventArgs e) => ReconcileDevices();
 
     private void Row_Toggled(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
         if ((sender as FrameworkElement)?.DataContext is not DeviceRow row) return;
 
-        if (row.Enabled) TryAddRow(row);
+        if (row.Enabled)
+        {
+            // Reintento manual: borra el historial de fallos/caídas para empezar de cero.
+            _addFailures.Remove(row.Id);
+            _stops.Remove(row.Id);
+            TryAddRow(row);
+        }
         else if (row.IsOutputRole) _engine.RemoveOutput(row.Id);
         else _engine.RemoveSource(row.Id);
 
@@ -505,7 +655,8 @@ public partial class MainWindow : Window
             double freq = 440;
             foreach (var row in _outputs)
             {
-                if (!_devicesById.TryGetValue(row.Id, out var dev)) continue;
+                var dev = ResolveFresh(row.Id);
+                if (dev == null) continue;
                 SetStatus($"Tono directo ({freq:F0} Hz) → {row.Name}…");
                 try { await PlayToneAsync(dev, freq, 1.5); }
                 catch (Exception ex)
@@ -635,6 +786,9 @@ public partial class MainWindow : Window
         _exiting = true;
         SyncConfigFromUi();
         _config.Save();
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        if (_notifier != null) { try { _enumerator.UnregisterEndpointNotificationCallback(_notifier); } catch { } }
+        _reconcileTimer.Stop();
         _tray.Visible = false;
         _tray.Dispose();
         _engine.Dispose();

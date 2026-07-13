@@ -44,6 +44,104 @@ public sealed class PeakMeter : ISampleProvider
 }
 
 /// <summary>
+/// Conversor de tasa asíncrono (ASRC) por salida. La bomba empuja la mezcla a 48 kHz de reloj
+/// de PARED; cada tarjeta la consume al ritmo de SU propio reloj de hardware. Sin compensar, dos
+/// salidas en la misma sala derivan hasta oírse en eco. Este proveedor lee del buffer de la
+/// salida y ajusta de forma continua y suave (±0.4 %) cuántas muestras de entrada gasta por cada
+/// muestra que entrega, para mantener el buffer en una latencia OBJETIVO fija. Así todas las
+/// salidas quedan ancladas al mismo reloj (el de la bomba) — y por tanto en fase entre sí.
+/// </summary>
+public sealed class DriftCompensatingResampler : ISampleProvider
+{
+    private const int Channels = 2;
+    private const double Kp = 0.0001;      // corrección por ms de error de latencia
+    private const double MaxDev = 0.004;   // tope de ±0.4 %: inaudible, imposible que "gorjee"
+    private const double HardResyncMs = 120;// error mayor = hipo real (stall/reanudar): salto de golpe
+
+    private readonly BufferedWaveProvider _backlog; // fuente de la medida de latencia acumulada
+    private readonly ISampleProvider _src;          // lectura del mismo buffer, muestra a muestra
+    private readonly double _targetMs;
+    private readonly float[] _one = new float[Channels];
+
+    private double _ratio = 1.0;   // muestras de entrada consumidas por muestra de salida
+    private double _frac;          // posición fraccional entre in0 e in1, en [0,1)
+    private float _l0, _r0, _l1, _r1;
+    private bool _primed;
+
+    public WaveFormat WaveFormat { get; }
+
+    public DriftCompensatingResampler(BufferedWaveProvider backlog, double targetMs)
+    {
+        _backlog = backlog;
+        _src = backlog.ToSampleProvider();
+        WaveFormat = backlog.WaveFormat;
+        _targetMs = targetMs;
+    }
+
+    // ReadFully=true en el buffer ⇒ siempre devuelve el frame pedido (silencio si está vacío).
+    private void PullFrame(out float l, out float r)
+    {
+        int n = _src.Read(_one, 0, Channels);
+        if (n < Channels) { l = 0; r = 0; return; }
+        l = _one[0]; r = _one[1];
+    }
+
+    // Descarta de golpe el exceso de latencia (un blip audible), solo ante un salto grande.
+    private void HardResync(double excessMs)
+    {
+        int dropFrames = (int)(excessMs / 1000.0 * WaveFormat.SampleRate);
+        var scratch = new float[Channels * 512];
+        int toRead = dropFrames * Channels;
+        while (toRead > 0)
+        {
+            int r = _src.Read(scratch, 0, Math.Min(scratch.Length, toRead));
+            if (r == 0) break;
+            toRead -= r;
+        }
+        _primed = false; _frac = 0; _ratio = 1.0;
+    }
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        double fillMs = _backlog.BufferedDuration.TotalMilliseconds;
+        double error = fillMs - _targetMs;
+
+        if (error > HardResyncMs)
+        {
+            HardResync(error);
+            error = 0; // el buffer quedó en el objetivo: parte de ratio neutro, no del error viejo
+        }
+
+        // Buffer por encima del objetivo ⇒ consumir más rápido (ratio>1) para drenarlo; por
+        // debajo ⇒ más lento. Ganancia pequeña ⇒ la corrección es gradual e inaudible.
+        _ratio = 1.0 + Math.Clamp(Kp * error, -MaxDev, MaxDev);
+
+        if (!_primed)
+        {
+            PullFrame(out _l0, out _r0);
+            PullFrame(out _l1, out _r1);
+            _primed = true;
+        }
+
+        int frames = count / Channels;
+        for (int i = 0; i < frames; i++)
+        {
+            float t = (float)_frac;
+            buffer[offset++] = _l0 + (_l1 - _l0) * t;
+            buffer[offset++] = _r0 + (_r1 - _r0) * t;
+            _frac += _ratio;
+            while (_frac >= 1.0)
+            {
+                _frac -= 1.0;
+                _l0 = _l1; _r0 = _r1;
+                PullFrame(out _l1, out _r1);
+            }
+        }
+        return frames * Channels;
+    }
+}
+
+/// <summary>
 /// Una fuente capturada: loopback de un dispositivo de salida (lo que suena en él)
 /// o un dispositivo de captura (micrófono). Entrega audio ya convertido al formato del mezclador.
 /// </summary>
@@ -58,6 +156,11 @@ public sealed class SourceTap : IDisposable
     private readonly VolumeSampleProvider _volume;
     private readonly PeakMeter _meter;
     private long _bytesIn;
+    private volatile bool _disposed;
+
+    /// <summary>Se dispara (con el ID del dispositivo) si la captura muere sola (dispositivo invalidado
+    /// al suspender/reanudar o al desconectarse). NAudio no reintenta: el motor lo propaga para reconstruir.</summary>
+    public event Action<string>? Broken;
 
     public string DeviceId { get; }
     public ISampleProvider Output => _meter;
@@ -101,11 +204,19 @@ public sealed class SourceTap : IDisposable
 
         _volume = new VolumeSampleProvider(sp) { Volume = volume };
         _meter = new PeakMeter(_volume);
+        _capture.RecordingStopped += OnRecordingStopped;
         _capture.StartRecording();
+    }
+
+    private void OnRecordingStopped(object? sender, StoppedEventArgs e)
+    {
+        if (!_disposed) Broken?.Invoke(DeviceId);
     }
 
     public void Dispose()
     {
+        _disposed = true;
+        try { _capture.RecordingStopped -= OnRecordingStopped; } catch { }
         try { _capture.StopRecording(); } catch { /* ya detenido o dispositivo retirado */ }
         _capture.Dispose();
     }
@@ -117,7 +228,6 @@ public sealed class SourceTap : IDisposable
 /// </summary>
 public sealed class OutputLeg : IDisposable
 {
-    private static readonly TimeSpan ResyncThreshold = TimeSpan.FromMilliseconds(150);
     private static readonly TimeSpan Prefill = TimeSpan.FromMilliseconds(40);
 
     private readonly BufferedWaveProvider _buffer;
@@ -125,6 +235,11 @@ public sealed class OutputLeg : IDisposable
     private readonly PeakMeter _meter;
     private readonly WasapiOut _out;
     private readonly int _prefillBytes;
+    private volatile bool _disposed;
+
+    /// <summary>Se dispara (con el ID del dispositivo) si la reproducción muere sola (dispositivo invalidado
+    /// al suspender/reanudar o al desconectarse). NAudio no reintenta: el motor lo propaga para reconstruir.</summary>
+    public event Action<string>? Broken;
 
     public string DeviceId { get; }
     public float Peak => _meter.Peak;
@@ -148,27 +263,35 @@ public sealed class OutputLeg : IDisposable
         _prefillBytes -= _prefillBytes % mixFormat.BlockAlign;
         WritePrefill();
 
-        _volume = new VolumeSampleProvider(_buffer.ToSampleProvider()) { Volume = volume };
+        // El ASRC mantiene el buffer en ~Prefill de latencia atando esta salida al reloj de la
+        // bomba, de modo que todas las salidas quedan en fase entre sí (antes derivaban).
+        var drift = new DriftCompensatingResampler(_buffer, Prefill.TotalMilliseconds);
+        _volume = new VolumeSampleProvider(drift) { Volume = volume };
         _meter = new PeakMeter(_volume);
         _out = new WasapiOut(device, AudioClientShareMode.Shared, true, 40);
         _out.Init(new SampleToWaveProvider(_meter));
+        _out.PlaybackStopped += OnPlaybackStopped;
         _out.Play();
     }
 
-    // Colchón de silencio: mantiene la latencia estable en vez de leer un buffer vacío (crujidos).
+    // Colchón de silencio: fija la latencia inicial en el objetivo del ASRC en vez de arrancar vacío.
     private void WritePrefill() => _buffer.AddSamples(new byte[_prefillBytes], 0, _prefillBytes);
 
-    public void Write(byte[] data, int count)
+    // La bomba empuja los MISMOS bytes a todas las salidas; el ASRC de cada una compensa la
+    // deriva de su reloj. El desborde extremo lo acota DiscardOnBufferOverflow del buffer.
+    public void Write(byte[] data, int count) => _buffer.AddSamples(data, 0, count);
+
+    private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
     {
-        if (_buffer.BufferedDuration > ResyncThreshold)
-        {
-            _buffer.ClearBuffer();
-            WritePrefill();
-        }
-        _buffer.AddSamples(data, 0, count);
+        if (!_disposed) Broken?.Invoke(DeviceId);
     }
 
-    public void Dispose() => _out.Dispose();
+    public void Dispose()
+    {
+        _disposed = true;
+        try { _out.PlaybackStopped -= OnPlaybackStopped; } catch { }
+        _out.Dispose();
+    }
 }
 
 /// <summary>
@@ -197,6 +320,11 @@ public sealed class AudioEngine : IDisposable
     public long TotalPumpedBytes => Interlocked.Read(ref _pumpedBytes);
     public long TotalTapBytes { get { lock (_lock) return _taps.Values.Sum(t => t.BytesIn); } }
     public float MixPeak => _mixPeak;
+
+    /// <summary>Una fuente o salida murió sola (dispositivo invalidado al suspender/reanudar,
+    /// cambio de driver, desconexión); entrega su ID. La UI lo escucha para reconstruir el motor
+    /// con dispositivos frescos y para frenar dispositivos que se caen en bucle.</summary>
+    public event Action<string>? DeviceLost;
 
     public float MasterVolume
     {
@@ -288,6 +416,7 @@ public sealed class AudioEngine : IDisposable
         {
             if (_taps.ContainsKey(device.ID)) return;
             var tap = new SourceTap(device, MixRate, volume);
+            tap.Broken += id => DeviceLost?.Invoke(id);
             _taps[device.ID] = tap;
             _mixer.AddMixerInput(tap.Output);
         }
@@ -319,7 +448,9 @@ public sealed class AudioEngine : IDisposable
         lock (_lock)
         {
             if (_legs.ContainsKey(device.ID)) return;
-            _legs[device.ID] = new OutputLeg(device, MixFormat, volume);
+            var leg = new OutputLeg(device, MixFormat, volume);
+            leg.Broken += id => DeviceLost?.Invoke(id);
+            _legs[device.ID] = leg;
         }
     }
 
