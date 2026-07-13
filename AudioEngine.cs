@@ -18,6 +18,31 @@ public sealed class LowLatencyLoopbackCapture : WasapiCapture
         => AudioClientStreamFlags.Loopback | base.GetAudioClientStreamFlags();
 }
 
+/// <summary>Mide el pico del último bloque leído; alimenta las barras de nivel de la UI.</summary>
+public sealed class PeakMeter : ISampleProvider
+{
+    private readonly ISampleProvider _source;
+    private volatile float _peak;
+
+    public PeakMeter(ISampleProvider source) => _source = source;
+
+    public WaveFormat WaveFormat => _source.WaveFormat;
+    public float Peak => _peak;
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        int read = _source.Read(buffer, offset, count);
+        float max = 0;
+        for (int i = 0; i < read; i++)
+        {
+            float a = Math.Abs(buffer[offset + i]);
+            if (a > max) max = a;
+        }
+        _peak = max;
+        return read;
+    }
+}
+
 /// <summary>
 /// Una fuente capturada: loopback de un dispositivo de salida (lo que suena en él)
 /// o un dispositivo de captura (micrófono). Entrega audio ya convertido al formato del mezclador.
@@ -31,11 +56,13 @@ public sealed class SourceTap : IDisposable
     private readonly IWaveIn _capture;
     private readonly BufferedWaveProvider _buffer;
     private readonly VolumeSampleProvider _volume;
+    private readonly PeakMeter _meter;
     private long _bytesIn;
 
     public string DeviceId { get; }
-    public ISampleProvider Output => _volume;
+    public ISampleProvider Output => _meter;
     public long BytesIn => Interlocked.Read(ref _bytesIn);
+    public float Peak => _meter.Peak;
 
     public float Volume
     {
@@ -73,6 +100,7 @@ public sealed class SourceTap : IDisposable
             sp = new WdlResamplingSampleProvider(sp, mixRate);
 
         _volume = new VolumeSampleProvider(sp) { Volume = volume };
+        _meter = new PeakMeter(_volume);
         _capture.StartRecording();
     }
 
@@ -94,10 +122,12 @@ public sealed class OutputLeg : IDisposable
 
     private readonly BufferedWaveProvider _buffer;
     private readonly VolumeSampleProvider _volume;
+    private readonly PeakMeter _meter;
     private readonly WasapiOut _out;
     private readonly int _prefillBytes;
 
     public string DeviceId { get; }
+    public float Peak => _meter.Peak;
 
     public float Volume
     {
@@ -119,8 +149,9 @@ public sealed class OutputLeg : IDisposable
         WritePrefill();
 
         _volume = new VolumeSampleProvider(_buffer.ToSampleProvider()) { Volume = volume };
+        _meter = new PeakMeter(_volume);
         _out = new WasapiOut(device, AudioClientShareMode.Shared, true, 40);
-        _out.Init(new SampleToWaveProvider(_volume));
+        _out.Init(new SampleToWaveProvider(_meter));
         _out.Play();
     }
 
@@ -308,6 +339,18 @@ public sealed class AudioEngine : IDisposable
             if (_legs.TryGetValue(deviceId, out var leg))
                 leg.Volume = volume;
         }
+    }
+
+    public float GetSourcePeak(string deviceId)
+    {
+        lock (_lock)
+            return _taps.TryGetValue(deviceId, out var tap) ? tap.Peak : 0f;
+    }
+
+    public float GetOutputPeak(string deviceId)
+    {
+        lock (_lock)
+            return _legs.TryGetValue(deviceId, out var leg) ? leg.Peak : 0f;
     }
 
     /// <summary>Inyecta un tono en el mezclador; al terminar, el mezclador lo retira solo.</summary>

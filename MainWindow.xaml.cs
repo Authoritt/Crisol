@@ -42,6 +42,20 @@ public class DeviceRow : INotifyPropertyChanged
     public bool IsUnlocked => _isUnlocked;
     public string? LockReason => _lockReason;
 
+    private double _level;
+
+    /// <summary>Nivel de la barra VU, 0..1 (ya con caída suave aplicada por el timer de la UI).</summary>
+    public double Level
+    {
+        get => _level;
+        set
+        {
+            if (Math.Abs(_level - value) < 0.004) return;
+            _level = value;
+            Raise(nameof(Level));
+        }
+    }
+
     public void SetLock(bool locked, string? reason)
     {
         _isUnlocked = !locked;
@@ -83,6 +97,10 @@ public partial class MainWindow : Window
         _saveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(600) };
         _saveTimer.Tick += (_, _) => { _saveTimer.Stop(); SyncConfigFromUi(); _config.Save(); };
 
+        var vuTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(33) };
+        vuTimer.Tick += (_, _) => UpdateVuMeters();
+        vuTimer.Start();
+
         SetupTray();
         RefreshDevices();
         StartEngineFromUi();
@@ -113,6 +131,11 @@ public partial class MainWindow : Window
             _sources.Clear();
             foreach (var d in renders.Concat(captures))
             {
+                string name = SafeName(d);
+                // Del cable virtual solo interesa su loopback principal: el 16ch y el lado
+                // de captura "CABLE Output" llevan el mismo audio y solo confunden.
+                if (IsVbCable(name) && (d.DataFlow == DataFlow.Capture || !IsCable(name)))
+                    continue;
                 var saved = AppConfig.GetOrAdd(_config.Sources, d.ID);
                 _sources.Add(new DeviceRow
                 {
@@ -127,9 +150,9 @@ public partial class MainWindow : Window
             _defaultRenderId = DefaultRenderId(renders);
 
             _outputs.Clear();
-            // CABLE Input es un embudo virtual mudo: como salida física no tiene sentido
-            // y marcarlo bloquearía su fila de fuente, que es su único uso.
-            foreach (var d in renders.Where(d => !IsCable(SafeName(d))))
+            // Los endpoints del cable virtual son embudos mudos: como salida física no tienen
+            // sentido y marcarlos bloquearía la fila de fuente, que es su único uso.
+            foreach (var d in renders.Where(d => !IsVbCable(SafeName(d))))
             {
                 var saved = AppConfig.GetOrAdd(_config.Outputs, d.ID);
                 _outputs.Add(new DeviceRow
@@ -152,8 +175,13 @@ public partial class MainWindow : Window
         }
     }
 
+    // El cable puede estar renombrado (p. ej. "Crisol"), pero el paréntesis del driver
+    // ("VB-Audio Virtual Cable") no cambia: identifícalo por ahí, nunca por el nombre visible.
+    private static bool IsVbCable(string name) =>
+        name.Contains("VB-Audio Virtual Cable", StringComparison.OrdinalIgnoreCase);
+
     private static bool IsCable(string name) =>
-        name.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase);
+        IsVbCable(name) && !name.Contains("16", StringComparison.Ordinal);
 
     private DeviceRow? FindCableSource() =>
         _sources.FirstOrDefault(s => !s.IsMic && IsCable(s.Name));
@@ -264,6 +292,23 @@ public partial class MainWindow : Window
             _loading = prev;
             SetStatus($"No se pudo usar «{row.Name}»: {ex.Message}");
         }
+    }
+
+    private void UpdateVuMeters()
+    {
+        // Solo las ventanas visibles importan; en bandeja la mezcla sigue pero no se dibuja.
+        if (!IsVisible) return;
+        foreach (var row in _sources)
+            AnimateLevel(row, row.Enabled ? _engine.GetSourcePeak(row.Id) : 0f);
+        foreach (var row in _outputs)
+            AnimateLevel(row, row.Enabled ? _engine.GetOutputPeak(row.Id) : 0f);
+    }
+
+    private static void AnimateLevel(DeviceRow row, float peak)
+    {
+        // Sube instantáneo, cae suave: el clásico comportamiento de un VU.
+        double target = Math.Clamp(peak, 0, 1);
+        row.Level = target >= row.Level ? target : row.Level * 0.72;
     }
 
     private void UpdateStatus()
@@ -405,6 +450,25 @@ public partial class MainWindow : Window
         }
         _defaultRenderId = cable.Id;
 
+        // Pulido de nombres (mejor esfuerzo): el cable pasa a llamarse "Crisol" y las
+        // variantes 16ch se ocultan del panel de sonido — solo confunden.
+        try
+        {
+            if (!cable.Name.StartsWith("Crisol", StringComparison.OrdinalIgnoreCase))
+                PolicyConfig.RenameEndpoint(cable.Id, "Crisol");
+        }
+        catch { }
+        foreach (var kv in _devicesById)
+        {
+            try
+            {
+                string n = SafeName(kv.Value);
+                if (IsVbCable(n) && n.Contains("16", StringComparison.Ordinal))
+                    PolicyConfig.HideEndpoint(kv.Key);
+            }
+            catch { }
+        }
+
         _loading = true;
         try
         {
@@ -419,10 +483,12 @@ public partial class MainWindow : Window
             _loading = false;
         }
         UpdateLocks();
+        SyncConfigFromUi();
+        _config.Save();
+        _engine.RemoveAll();
+        RefreshDevices();
         StartEngineFromUi();
-        QueueSave();
-        UpdateCableButton();
-        SetStatus($"Cable activo: el audio de Windows entra por CABLE Input y suena por {_engine.OutputCount} salida(s), sincronizadas y sin lag entre ellas.");
+        SetStatus($"Cable activo: el audio de Windows entra por «Crisol» y suena por {_engine.OutputCount} salida(s), sincronizadas y sin lag entre ellas.");
     }
 
     // ---------- prueba de sonido ----------

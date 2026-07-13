@@ -14,24 +14,36 @@
         <Style TargetType="Slider">
             <Setter Property="IsMoveToPointEnabled" Value="True"/>
         </Style>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
         <DataTemplate x:Key="DeviceRowTemplate">
-            <Grid Margin="0,3">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="150"/>
-                    <ColumnDefinition Width="34"/>
-                </Grid.ColumnDefinitions>
-                <CheckBox Content="{Binding Label}" IsChecked="{Binding Enabled, Mode=TwoWay}"
-                          IsEnabled="{Binding IsUnlocked}" ToolTip="{Binding LockReason}"
-                          ToolTipService.ShowOnDisabled="True"
-                          Checked="Row_Toggled" Unchecked="Row_Toggled"
-                          VerticalAlignment="Center"/>
-                <Slider Grid.Column="1" Maximum="100" Value="{Binding Volume, Mode=TwoWay}"
-                        IsEnabled="{Binding IsUnlocked}"
-                        ValueChanged="RowVolume_Changed" VerticalAlignment="Center"/>
-                <TextBlock Grid.Column="2" Text="{Binding VolumeText}" TextAlignment="Right"
-                           VerticalAlignment="Center" Foreground="#FF9A9AA5"/>
-            </Grid>
+            <StackPanel Margin="0,3">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="150"/>
+                        <ColumnDefinition Width="34"/>
+                    </Grid.ColumnDefinitions>
+                    <CheckBox Content="{Binding Label}" IsChecked="{Binding Enabled, Mode=TwoWay}"
+                              IsEnabled="{Binding IsUnlocked}" ToolTip="{Binding LockReason}"
+                              ToolTipService.ShowOnDisabled="True"
+                              Checked="Row_Toggled" Unchecked="Row_Toggled"
+                              VerticalAlignment="Center"/>
+                    <Slider Grid.Column="1" Maximum="100" Value="{Binding Volume, Mode=TwoWay}"
+                            IsEnabled="{Binding IsUnlocked}"
+                            ValueChanged="RowVolume_Changed" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Column="2" Text="{Binding VolumeText}" TextAlignment="Right"
+                               VerticalAlignment="Center" Foreground="#FF9A9AA5"/>
+                </Grid>
+                <!-- VU: sube al instante y cae suave (el timer de la UI anima Level) -->
+                <Border Height="3" Margin="22,3,40,0" Background="#FF2A2A32" CornerRadius="1.5"
+                        Visibility="{Binding Enabled, Converter={StaticResource BoolToVis}}">
+                    <Rectangle Fill="#FFE8853B" RadiusX="1.5" RadiusY="1.5" RenderTransformOrigin="0,0.5">
+                        <Rectangle.RenderTransform>
+                            <ScaleTransform ScaleX="{Binding Level}"/>
+                        </Rectangle.RenderTransform>
+                    </Rectangle>
+                </Border>
+            </StackPanel>
         </DataTemplate>
     </Window.Resources>
 
