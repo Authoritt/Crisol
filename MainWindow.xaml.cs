@@ -66,6 +66,10 @@ public partial class MainWindow : Window
     private WinForms.NotifyIcon _tray = null!;
     private bool _exiting;
     private bool _loading;
+    private string? _defaultRenderId;
+
+    private enum CableAction { Install, Activate, None }
+    private CableAction _cableAction = CableAction.Install;
 
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string RunValueName = "Crisol";
@@ -120,8 +124,12 @@ public partial class MainWindow : Window
                 });
             }
 
+            _defaultRenderId = DefaultRenderId(renders);
+
             _outputs.Clear();
-            foreach (var d in renders)
+            // CABLE Input es un embudo virtual mudo: como salida física no tiene sentido
+            // y marcarlo bloquearía su fila de fuente, que es su único uso.
+            foreach (var d in renders.Where(d => !IsCable(SafeName(d))))
             {
                 var saved = AppConfig.GetOrAdd(_config.Outputs, d.ID);
                 _outputs.Add(new DeviceRow
@@ -136,10 +144,40 @@ public partial class MainWindow : Window
 
             MasterSlider.Value = Math.Clamp(_config.MasterVolume, 0, 100);
             UpdateLocks();
+            UpdateCableButton();
         }
         finally
         {
             _loading = false;
+        }
+    }
+
+    private static bool IsCable(string name) =>
+        name.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase);
+
+    private DeviceRow? FindCableSource() =>
+        _sources.FirstOrDefault(s => !s.IsMic && IsCable(s.Name));
+
+    private void UpdateCableButton()
+    {
+        var cable = FindCableSource();
+        if (cable == null)
+        {
+            _cableAction = CableAction.Install;
+            CableButton.Content = "Instalar cable virtual (elimina el lag)";
+            CableButton.IsEnabled = true;
+        }
+        else if (_defaultRenderId != cable.Id)
+        {
+            _cableAction = CableAction.Activate;
+            CableButton.Content = "Activar cable (salida por defecto de Windows)";
+            CableButton.IsEnabled = true;
+        }
+        else
+        {
+            _cableAction = CableAction.None;
+            CableButton.Content = "Cable virtual activo ✓";
+            CableButton.IsEnabled = false;
         }
     }
 
@@ -294,6 +332,97 @@ public partial class MainWindow : Window
         if (row.IsOutputRole) _engine.SetOutputVolume(row.Id, v);
         else _engine.SetSourceVolume(row.Id, v);
         QueueSave();
+    }
+
+    // ---------- cable virtual ----------
+
+    private async void Cable_Click(object sender, RoutedEventArgs e)
+    {
+        if (_cableAction == CableAction.None) return;
+
+        if (_cableAction == CableAction.Activate)
+        {
+            var cable = FindCableSource();
+            if (cable != null) ActivateCable(cable);
+            return;
+        }
+
+        CableButton.IsEnabled = false;
+        try
+        {
+            SetStatus("Descargando VB-CABLE desde vb-audio.com…");
+            string setup = await CableInstaller.DownloadAsync();
+            SetStatus("Instalando el driver — acepta el aviso de UAC…");
+            int code = await CableInstaller.InstallAsync(setup);
+            SetStatus($"Instalador terminado (código {code}). Buscando CABLE Input…");
+            await Task.Delay(2000);
+            Refresh_Click(this, e);
+            var cable = FindCableSource();
+            if (cable != null)
+            {
+                ActivateCable(cable);
+            }
+            else
+            {
+                SetStatus("Driver instalado, pero CABLE Input aún no aparece: reinicia Windows y vuelve a pulsar este botón.");
+                MessageBox.Show(
+                    "VB-CABLE quedó instalado, pero Windows necesita reiniciarse para que aparezca el dispositivo.\n\n" +
+                    "Después de reiniciar, abre Crisol y pulsa \"Activar cable\".",
+                    "Crisol", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            SetStatus("Instalación cancelada en el UAC.");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Falló la instalación del cable: " + ex.Message);
+        }
+        finally
+        {
+            UpdateCableButton();
+        }
+    }
+
+    /// <summary>
+    /// Pone CABLE Input como salida por defecto de Windows (todo el audio entra ahí, mudo),
+    /// lo marca como fuente y convierte la antigua salida por defecto en salida de Crisol
+    /// para que no se quede sin sonido.
+    /// </summary>
+    private void ActivateCable(DeviceRow cable)
+    {
+        string? oldDefault = _defaultRenderId;
+        try
+        {
+            PolicyConfig.SetDefaultDevice(cable.Id);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("No pude cambiar la salida por defecto (" + ex.Message +
+                      "): ponla a mano en Configuración → Sonido → CABLE Input.");
+            return;
+        }
+        _defaultRenderId = cable.Id;
+
+        _loading = true;
+        try
+        {
+            cable.Enabled = true;
+            var oldSrc = _sources.FirstOrDefault(s => s.Id == oldDefault);
+            if (oldSrc is { Enabled: true }) oldSrc.Enabled = false;
+            var oldOut = _outputs.FirstOrDefault(o => o.Id == oldDefault);
+            if (oldOut is { Enabled: false }) oldOut.Enabled = true;
+        }
+        finally
+        {
+            _loading = false;
+        }
+        UpdateLocks();
+        StartEngineFromUi();
+        QueueSave();
+        UpdateCableButton();
+        SetStatus($"Cable activo: el audio de Windows entra por CABLE Input y suena por {_engine.OutputCount} salida(s), sincronizadas y sin lag entre ellas.");
     }
 
     // ---------- prueba de sonido ----------

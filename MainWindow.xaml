@@ -50,6 +50,10 @@
                         VerticalAlignment="Center" ValueChanged="Master_Changed"/>
                 <TextBlock x:Name="MasterPct" Grid.Column="2" Text="100" TextAlignment="Right" VerticalAlignment="Center"/>
             </Grid>
+            <Button x:Name="CableButton" HorizontalAlignment="Left" Padding="10,3" Margin="0,10,0,0"
+                    Content="Instalar cable virtual (elimina el lag)"
+                    ToolTip="Instala el driver gratuito VB-CABLE, lo pone como salida por defecto de Windows y reconfigura Crisol"
+                    Click="Cable_Click"/>
             <CheckBox x:Name="AutostartCheck" Margin="0,10,0,0"
                       Content="Iniciar con Windows (arranca en la bandeja)"
                       Checked="Autostart_Changed" Unchecked="Autostart_Changed"/>
