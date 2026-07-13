@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
@@ -18,9 +19,11 @@ public sealed class SourceTap : IDisposable
     private readonly IWaveIn _capture;
     private readonly BufferedWaveProvider _buffer;
     private readonly VolumeSampleProvider _volume;
+    private long _bytesIn;
 
     public string DeviceId { get; }
     public ISampleProvider Output => _volume;
+    public long BytesIn => Interlocked.Read(ref _bytesIn);
 
     public float Volume
     {
@@ -43,6 +46,7 @@ public sealed class SourceTap : IDisposable
         };
         _capture.DataAvailable += (_, e) =>
         {
+            Interlocked.Add(ref _bytesIn, e.BytesRecorded);
             if (_buffer.BufferedDuration > ResyncThreshold)
                 _buffer.ClearBuffer();
             _buffer.AddSamples(e.Buffer, 0, e.BytesRecorded);
@@ -141,9 +145,15 @@ public sealed class AudioEngine : IDisposable
     private readonly object _lock = new();
     private readonly Thread _pump;
     private volatile bool _running = true;
+    private long _pumpedBytes;
+    private float _mixPeak;
 
     public int SourceCount { get { lock (_lock) return _taps.Count; } }
     public int OutputCount { get { lock (_lock) return _legs.Count; } }
+    public bool PumpAlive => _pump.IsAlive;
+    public long TotalPumpedBytes => Interlocked.Read(ref _pumpedBytes);
+    public long TotalTapBytes { get { lock (_lock) return _taps.Values.Sum(t => t.BytesIn); } }
+    public float MixPeak => _mixPeak;
 
     public float MasterVolume
     {
@@ -176,29 +186,57 @@ public sealed class AudioEngine : IDisposable
         var sw = Stopwatch.StartNew();
         long sent = 0;
 
+        int errorsLogged = 0;
         while (_running)
         {
-            long target = (long)(sw.Elapsed.TotalSeconds * byteRate);
-            target -= target % blockAlign;
-            if (target - sent > maxBacklog)
-                sent = target - maxBacklog;
-
-            while (sent < target && _running)
+            try
             {
-                int n = (int)Math.Min(chunk.Length, target - sent);
-                n -= n % blockAlign;
-                if (n == 0) break;
-                int read = _masterWave.Read(chunk, 0, n);
-                if (read == 0) break;
-                lock (_lock)
+                long target = (long)(sw.Elapsed.TotalSeconds * byteRate);
+                target -= target % blockAlign;
+                if (target - sent > maxBacklog)
+                    sent = target - maxBacklog;
+
+                while (sent < target && _running)
                 {
-                    foreach (var leg in _legs.Values)
-                        leg.Write(chunk, read);
+                    int n = (int)Math.Min(chunk.Length, target - sent);
+                    n -= n % blockAlign;
+                    if (n == 0) break;
+                    int read = _masterWave.Read(chunk, 0, n);
+                    if (read == 0) break;
+                    for (int i = 0; i + 3 < read; i += 4)
+                    {
+                        float s = Math.Abs(BitConverter.ToSingle(chunk, i));
+                        if (s > _mixPeak) _mixPeak = s;
+                    }
+                    lock (_lock)
+                    {
+                        foreach (var leg in _legs.Values)
+                            leg.Write(chunk, read);
+                    }
+                    sent += read;
+                    Interlocked.Add(ref _pumpedBytes, read);
                 }
-                sent += read;
+            }
+            catch (Exception ex)
+            {
+                // La bomba no puede morir en silencio: sin ella todas las salidas enmudecen.
+                if (errorsLogged++ < 5) LogError(ex);
+                Thread.Sleep(200);
             }
             Thread.Sleep(5);
         }
+    }
+
+    private static void LogError(Exception ex)
+    {
+        try
+        {
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Crisol");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "error.log"),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] PUMP: {ex}\r\n");
+        }
+        catch { }
     }
 
     public void AddSource(MMDevice device, float volume)
